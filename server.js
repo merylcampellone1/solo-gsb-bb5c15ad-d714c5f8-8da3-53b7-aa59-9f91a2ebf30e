@@ -5,7 +5,11 @@
  *
  * 设计要点：
  * - 音频文件只保存在本机磁盘（DATA_DIR，默认 ./data/<sessionId>/）
- * - 会话状态（含 X 映射）只保存在本机内存中，提交前任何接口都不会泄露映射
+ * - 会话状态（含 X 映射、盐）同样只保存在本机磁盘：每个会话目录内有一个
+ *   state.json（先写 state.json.tmp 再原子 rename，fsync 落盘），创建会话与
+ *   每次作答/提交在成功响应前完成原子写入；服务重启后启动恢复未过期、音频
+ *   完整、记录合法的会话，凭原恢复标识继续，已保存的答案 / 把握度 / 题序 /
+ *   承诺值与重启前一致。提交前任何接口都不会泄露映射
  * - 题序承诺核验：创建会话时生成 32 字节随机盐，按固定格式
  *   abx-v1|会话ID|题数|逐题A/B串|盐的十六进制 计算 SHA-256 承诺值；
  *   提交前创建 / 状态 / 恢复接口只返回承诺值（不返回盐与映射），
@@ -37,14 +41,66 @@ const ALLOWED_EXT = new Set([
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
-/** 会话仅保存在本机内存：id -> session */
+/** 会话内存索引：id -> session；会话权威状态同时原子落盘于 <dir>/state.json */
 const sessions = new Map();
 
 /** 恢复标识（仅存 SHA-256 哈希）：tokenHash -> sessionId，提交/删除/过期即移除 */
 const recoveryTokens = new Map();
 
+// ---------------------------------------------------------------------------
+// 会话状态持久化（每个会话目录内的 state.json）
+//
+// state.json 只保存在本机 data 目录，含 X 映射与盐（提交前不下发到任何接口）。
+// 写入采用「写临时文件 + fsync + 原子 rename」，崩溃只会留下完整新文件、
+// 完整旧文件或固定名 .tmp 半写入文件三种状态；启动时半写入的 .tmp 直接忽略
+// 并删除，缺 state.json / 损坏 / 校验不通过 / 音频缺失的目录一律不恢复。
+// ---------------------------------------------------------------------------
+
+const STATE_FILE = 'state.json';
+const STATE_TMP_FILE = 'state.json.tmp';
+const STATE_VERSION = 1;
+
 function hashToken(token) {
   return crypto.createHash('sha256').update(String(token)).digest('hex');
+}
+
+/** 同步原子写入状态文件：失败时抛出异常且不改动已有（已确认）state.json */
+function writeStateAtomic(s) {
+  const tmp = path.join(s.dir, STATE_TMP_FILE);
+  const final = path.join(s.dir, STATE_FILE);
+  const fd = fs.openSync(tmp, 'w');
+  try {
+    const payload = JSON.stringify({
+      version: STATE_VERSION,
+      id: s.id,
+      fileA: path.basename(s.fileA),
+      fileB: path.basename(s.fileB),
+      nameA: s.nameA,
+      nameB: s.nameB,
+      trials: s.trials, // [{ x: 'A'|'B', answer: null|'A'|'B', confidence: null|50..100 }]
+      mapping: s.mapping,
+      saltHex: s.saltHex,
+      commitment: s.commitment,
+      submitted: s.submitted,
+      createdAt: s.createdAt,
+      tokenHash: s.tokenHash, // 提交/删除/过期后置为 null，恢复标识随之永久失效
+    });
+    fs.writeSync(fd, payload);
+    fs.fsyncSync(fd); // 确保数据与目录项落盘后再 rename
+  } finally {
+    fs.closeSync(fd);
+  }
+  fs.renameSync(tmp, final); // 同目录 rename 原子替换
+}
+
+/**
+ * 把指定字段合并进会话状态并原子落盘；落盘失败时抛出异常，
+ * 调用方负责保证只有落盘成功后才把变更应用到内存（已确认状态不变）。
+ */
+function persistSession(s, patch) {
+  const shadow = Object.assign({}, s, patch);
+  writeStateAtomic(shadow);
+  Object.assign(s, patch);
 }
 
 /**
@@ -331,7 +387,8 @@ app.post('/api/session', (req, res) => {
     const numTrials = clampInt(req.body.numTrials, 1, MAX_TRIALS, 8);
     const id = req.abxSessionId;
 
-    // 服务端生成随机 X 题序：每题独立随机为 A 或 B，映射只存在于此
+    // 服务端生成随机 X 题序：每题独立随机为 A 或 B；映射只保存在本机
+    // （内存 + 本会话目录的 state.json），提交前不经任何接口下发
     const trials = Array.from({ length: numTrials }, () => ({
       x: crypto.randomInt(2) === 0 ? 'A' : 'B',
       answer: null,
@@ -364,6 +421,18 @@ app.post('/api/session', (req, res) => {
       tokenHash,
     });
     recoveryTokens.set(tokenHash, id);
+
+    // 成功响应前把完整状态原子写入会话目录；失败则该会话不成立，
+    // 清理目录与内存项后返回 500（不会留下可被恢复的半写入记录）
+    try {
+      writeStateAtomic(sessions.get(id));
+    } catch (e) {
+      recoveryTokens.delete(tokenHash);
+      sessions.delete(id);
+      removeDir(req.abxDir);
+      console.error('会话状态写入失败:', e.message);
+      return res.status(500).json({ error: '会话状态写入失败，请重试' });
+    }
 
     res.json({ id, numTrials, recoveryToken, commitment });
   });
@@ -454,7 +523,8 @@ app.post('/api/session/:id/answer', (req, res) => {
   if (!s) return;
   if (s.submitted) return res.status(409).json({ error: '已提交，不可再修改答案' });
   const { trial, answer, confidence } = req.body || {};
-  const t = s.trials[trial];
+  const n = Number.parseInt(trial, 10);
+  const t = s.trials[n];
   if (!t) return res.status(400).json({ error: '题号无效' });
   const hasAnswer = answer !== undefined && answer !== null;
   const hasConfidence = confidence !== undefined && confidence !== null;
@@ -468,19 +538,28 @@ app.post('/api/session/:id/answer', (req, res) => {
   if (hasConfidence && !CONFIDENCE_SET.has(confidence)) {
     return res.status(400).json({ error: '把握度无效（只允许 50%～100%，每 10% 一档）' });
   }
-  if (hasAnswer) t.answer = answer;
-  if (hasConfidence) t.confidence = confidence;
+
+  // 先在影子副本上应用变更并原子落盘；只有落盘成功才更新内存中的已确认状态，
+  // 写入失败返回 500 且本题已确认的答案 / 把握度保持不变
+  const nextTrials = s.trials.map((tr) => ({
+    x: tr.x, answer: tr.answer, confidence: tr.confidence,
+  }));
+  if (hasAnswer) nextTrials[n].answer = answer;
+  if (hasConfidence) nextTrials[n].confidence = confidence;
+  try {
+    persistSession(s, { trials: nextTrials });
+  } catch (e) {
+    console.error('作答状态写入失败:', e.message);
+    return res.status(500).json({ error: '答案保存失败（状态写入失败），请重试' });
+  }
   res.json({ ok: true });
 });
 
-app.post('/api/session/:id/submit', (req, res) => {
-  const s = getSession(req, res);
-  if (!s) return;
-  if (s.submitted) return res.json({ results: s.results }); // 幂等：重复提交返回同一结果
-  if (s.trials.some((t) => !t.answer || t.confidence === null)) {
-    return res.status(400).json({ error: '还有题目未作答或未选择把握度，无法提交' });
-  }
-  // 提交后一次性揭示：正确率 + 逐题映射（含把握度）+ 分档校准 + 题序承诺揭示
+/**
+ * 计算提交结果：正确率 + 逐题映射（含把握度）+ 分档校准 + 题序承诺揭示。
+ * 提交与重启后恢复已提交会话共用同一计算，保证重复提交 / 状态读取结果一致。
+ */
+function computeResults(s) {
   const detail = s.trials.map((t, i) => ({
     trial: i + 1,
     x: t.x,
@@ -489,7 +568,7 @@ app.post('/api/session/:id/submit', (req, res) => {
     correct: t.x === t.answer,
   }));
   const correct = detail.filter((d) => d.correct).length;
-  s.results = {
+  return {
     total: detail.length,
     correct,
     accuracy: correct / detail.length,
@@ -500,17 +579,49 @@ app.post('/api/session/:id/submit', (req, res) => {
     mapping: s.mapping,
     commitment: s.commitment,
   };
-  s.submitted = true;
-  dropRecoveryToken(s); // 提交后恢复标识立即失效
+}
+
+app.post('/api/session/:id/submit', (req, res) => {
+  const s = getSession(req, res);
+  if (!s) return;
+  if (s.submitted) return res.json({ results: s.results }); // 幂等：重复提交返回同一结果
+  if (s.trials.some((t) => !t.answer || t.confidence === null)) {
+    return res.status(400).json({ error: '还有题目未作答或未选择把握度，无法提交' });
+  }
+  const results = computeResults(s);
+  // 先原子落盘「已提交 + 恢复标识作废」状态，成功后才改变内存并揭示结果；
+  // 写入失败返回 500，会话仍为未提交、恢复标识仍有效，可重试
+  const tokenHash = s.tokenHash;
+  try {
+    persistSession(s, { results, submitted: true, tokenHash: null });
+  } catch (e) {
+    console.error('提交状态写入失败:', e.message);
+    return res.status(500).json({ error: '提交失败（状态写入失败），请重试' });
+  }
+  recoveryTokens.delete(tokenHash); // 提交后恢复标识立即失效（持久化中已置空）
   res.json({ results: s.results });
 });
 
 app.delete('/api/session/:id', (req, res) => {
   const s = sessions.get(req.params.id);
   if (s) {
-    dropRecoveryToken(s);
+    // 先从内存摘除并作废恢复标识，再同步删除磁盘目录后才响应：
+    // 保证删除响应返回后即使重启，原恢复标识也不会随目录被重新恢复
+    const tokenHash = s.tokenHash;
     sessions.delete(s.id);
-    removeDir(s.dir);
+    recoveryTokens.delete(tokenHash);
+    try {
+      fs.rmSync(s.dir, { recursive: true, force: true });
+    } catch (e) {
+      // 目录删除失败时退回持久化作废：把 tokenHash 置空原子落盘，
+      // 启动校验会因「未提交会话缺少恢复标识哈希」而拒绝恢复该目录
+      console.error('会话目录删除失败，改为持久化作废:', e.message);
+      try {
+        writeStateAtomic(Object.assign({}, s, { tokenHash: null }));
+      } catch (e2) {
+        console.error('会话作废状态写入也失败:', e2.message);
+      }
+    }
   }
   res.json({ ok: true });
 });
@@ -529,6 +640,180 @@ setInterval(() => {
     }
   }
 }, 3600 * 1000).unref();
+
+// ---------------------------------------------------------------------------
+// 启动恢复：扫描 data 目录，只恢复未过期、A/B 音频完整、记录合法的会话。
+// 损坏的 state.json、半写入的 state.json.tmp、缺音频、承诺值不自洽或过期的
+// 会话一律不恢复并删除其目录，避免脏数据被当合法会话继续使用。
+// ---------------------------------------------------------------------------
+
+const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const HEX64_RE = /^[0-9a-f]{64}$/;
+
+function isPlainObject(v) {
+  return v !== null && typeof v === 'object' && !Array.isArray(v);
+}
+
+/** 校验并重建一个会话记录；不合法返回 { error }，调用方删除其目录 */
+function loadSessionFromDir(dir) {
+  let st;
+  try {
+    st = JSON.parse(fs.readFileSync(path.join(dir, STATE_FILE), 'utf8'));
+  } catch (e) {
+    return { error: `state.json 无法解析: ${e.message}` };
+  }
+  if (!isPlainObject(st) || st.version !== STATE_VERSION) {
+    return { error: 'state.json 版本或结构不合法' };
+  }
+
+  // 基本字段与类型
+  const id = st.id;
+  if (typeof id !== 'string' || !SESSION_ID_RE.test(id) || path.basename(dir) !== id) {
+    return { error: '会话 ID 不合法或与目录名不一致' };
+  }
+  if (typeof st.saltHex !== 'string' || !/^[0-9a-f]{64}$/.test(st.saltHex)) {
+    return { error: '盐不合法' };
+  }
+  if (typeof st.commitment !== 'string' || !HEX64_RE.test(st.commitment)) {
+    return { error: '承诺值不合法' };
+  }
+  if (typeof st.mapping !== 'string' || !/^[AB]+$/.test(st.mapping)) {
+    return { error: '题序映射不合法' };
+  }
+  if (!Array.isArray(st.trials) || st.trials.length < 1 || st.trials.length > MAX_TRIALS) {
+    return { error: '题数不合法' };
+  }
+  if (st.mapping.length !== st.trials.length) {
+    return { error: '题序长度与题数不一致' };
+  }
+  if (typeof st.createdAt !== 'number' || !Number.isFinite(st.createdAt) || st.createdAt <= 0) {
+    return { error: '创建时间不合法' };
+  }
+  if (typeof st.submitted !== 'boolean') return { error: '提交标记不合法' };
+
+  // 逐题记录：x ∈ A/B 且与映射一致；answer ∈ null/A/B；confidence ∈ 合法档位或 null
+  for (let i = 0; i < st.trials.length; i++) {
+    const t = st.trials[i];
+    if (!isPlainObject(t)) return { error: `第 ${i + 1} 题记录不合法` };
+    if ((t.x !== 'A' && t.x !== 'B') || t.x !== st.mapping[i]) {
+      return { error: `第 ${i + 1} 题 X 映射不合法` };
+    }
+    if (t.answer !== null && t.answer !== 'A' && t.answer !== 'B') {
+      return { error: `第 ${i + 1} 题答案不合法` };
+    }
+    if (t.confidence !== null && !CONFIDENCE_SET.has(t.confidence)) {
+      return { error: `第 ${i + 1} 题把握度不合法` };
+    }
+  }
+
+  // 承诺值必须能用记录内的盐与映射重算出来（防止被篡改 / 半写入拼出的记录）
+  if (computeCommitment(id, st.trials.length, st.mapping, st.saltHex) !== st.commitment) {
+    return { error: '承诺值重算不一致' };
+  }
+
+  // 恢复标识哈希：未提交会话必须为 64 位十六进制；已提交会话必须为空
+  let tokenHash = st.tokenHash;
+  const hashValid = tokenHash === null ||
+    (typeof tokenHash === 'string' && HEX64_RE.test(tokenHash));
+  if (!hashValid) return { error: '恢复标识哈希不合法' };
+  if (st.submitted) {
+    tokenHash = null; // 已提交：恢复标识永久失效
+  } else if (tokenHash === null) {
+    return { error: '未提交会话缺少恢复标识哈希' };
+  }
+
+  // A/B 音频必须完整存在（文件名取自固定白名单扩展名且实际为非空常规文件）
+  const fileA = path.join(dir, path.basename(String(st.fileA || '')));
+  const fileB = path.join(dir, path.basename(String(st.fileB || '')));
+  if (path.dirname(fileA) !== dir || path.dirname(fileB) !== dir) {
+    return { error: '音频路径不合法' };
+  }
+  if (!ALLOWED_EXT.has(path.extname(fileA)) ||
+      !ALLOWED_EXT.has(path.extname(fileB)) ||
+      !isNonEmptyFile(fileA) || !isNonEmptyFile(fileB)) {
+    return { error: 'A/B 音频缺失或不完整' };
+  }
+
+  const s = {
+    id,
+    dir,
+    fileA,
+    fileB,
+    nameA: typeof st.nameA === 'string' ? st.nameA : path.basename(fileA),
+    nameB: typeof st.nameB === 'string' ? st.nameB : path.basename(fileB),
+    trials: st.trials,
+    mapping: st.mapping,
+    saltHex: st.saltHex,
+    commitment: st.commitment,
+    submitted: st.submitted,
+    results: null,
+    createdAt: st.createdAt,
+    tokenHash,
+  };
+  // 不直接信任落盘的结果：已提交会话按 trials 重算，保证与重启前响应完全一致
+  if (st.submitted) s.results = computeResults(s);
+  return { session: s };
+}
+
+function isNonEmptyFile(file) {
+  try {
+    const stat = fs.statSync(file);
+    return stat.isFile() && stat.size > 0;
+  } catch (_) {
+    return false;
+  }
+}
+
+function restoreSessions() {
+  let entries;
+  try {
+    entries = fs.readdirSync(DATA_DIR, { withFileTypes: true });
+  } catch (e) {
+    console.error('读取数据目录失败:', e.message);
+    return;
+  }
+
+  let restored = 0;
+  let dropped = 0;
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const dir = path.join(DATA_DIR, entry.name);
+
+    // 半写入的临时文件一律忽略并清除（原子写崩溃后可能残留）
+    try { fs.rmSync(path.join(dir, STATE_TMP_FILE), { force: true }); } catch (_) { /* 忽略 */ }
+
+    const now = Date.now();
+    const loaded = loadSessionFromDir(dir);
+    if (loaded.error) {
+      // 无 state.json（本目录可能不是会话目录）时只静默清理残留临时文件；
+      // 有记录但损坏 / 缺音频则删除整个目录，绝不让其被恢复
+      const hasState = fs.existsSync(path.join(dir, STATE_FILE));
+      if (hasState) {
+        console.warn(`跳过并清除不可恢复的会话目录 ${entry.name}: ${loaded.error}`);
+        fs.rmSync(dir, { recursive: true, force: true });
+        dropped++;
+      }
+      continue;
+    }
+
+    const s = loaded.session;
+    if (now - s.createdAt > SESSION_TTL_MS) {
+      // 已过期：不恢复，恢复标识持续失效，目录按既有过期策略清除
+      fs.rmSync(dir, { recursive: true, force: true });
+      dropped++;
+      continue;
+    }
+
+    sessions.set(s.id, s);
+    if (!s.submitted && s.tokenHash) recoveryTokens.set(s.tokenHash, s.id);
+    restored++;
+  }
+  if (restored || dropped) {
+    console.log(`启动恢复：恢复 ${restored} 个会话，丢弃 ${dropped} 个过期/损坏会话`);
+  }
+}
+
+restoreSessions();
 
 app.listen(PORT, () => {
   console.log(`ABX 盲听测试已启动: http://localhost:${PORT}`);
