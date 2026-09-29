@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ABX 盲听测试</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>ABX 盲听测试</h1>
+    <p class="sub">本地音频双盲对比 · 音频与会话仅保存在本机</p>
+  </header>
+
+  <main>
+    <!-- 视图 1：上传 -->
+    <section id="view-upload" class="view">
+      <!-- 可恢复会话提示（仅当本机存在未提交会话时显示） -->
+      <div id="view-resume" class="card resume-card hidden">
+        <h2>继续上次测试</h2>
+        <p id="resumeInfo" class="hint"></p>
+        <div class="resume-actions">
+          <button id="btnResume" class="primary">继续上次测试</button>
+          <button id="btnDiscardResume">放弃并删除该会话</button>
+        </div>
+        <p class="hint">恢复标识仅保存在本机浏览器中；提交或删除后立即失效。</p>
+      </div>
+
+      <!-- 题序承诺异常提示（恢复时承诺值与创建时本机保存的不一致，阻止继续答题） -->
+      <div id="view-tamper" class="card tamper-card hidden">
+        <h2>题序承诺核验异常</h2>
+        <p class="hint">服务端返回的题序承诺值与创建会话时本机保存的原值不一致，题序映射可能已被更改或会话数据损坏。为保护测试有效性，已阻止继续该测试，请放弃并删除该会话后重新开始。</p>
+        <button id="btnDiscardTamper" class="danger">放弃并删除该会话</button>
+      </div>
+
+      <div class="card">
+        <h2>上传音频</h2>
+        <p class="hint">请选择两个<strong>同格式</strong>的音频文件（如两个 WAV）。统一时间轴以较短的一个为准。</p>
+        <label class="field">
+          <span>音频 A</span>
+          <input type="file" id="fileA" accept="audio/*">
+        </label>
+        <label class="field">
+          <span>音频 B</span>
+          <input type="file" id="fileB" accept="audio/*">
+        </label>
+        <label class="field">
+          <span>题目数量（1–50）</span>
+          <input type="number" id="numTrials" min="1" max="50" value="8">
+        </label>
+        <button id="btnStart" class="primary">开始测试</button>
+        <p id="uploadError" class="error"></p>
+      </div>
+
+      <!-- 独立的题数规划器：纯统计计算，不创建会话、不保存任何数据 -->
+      <div class="card planner-card">
+        <h2>题数规划器</h2>
+        <p class="hint">在上传音频前估算需要多少题。检验规则为「n 题中答对至少 k 题则判定并非纯靠猜」：门槛 k 取满足假阳性概率 <code>P[Bin(n,0.5) ≥ k] ≤ α</code> 的最小整数，实际功效为 <code>P[Bin(n,p) ≥ k]</code>，全部使用<strong>精确二项尾概率</strong>（非正态近似）。本规划器仅在本机计算，<strong>不会创建测试会话</strong>。</p>
+        <form id="plannerForm" class="planner-form" novalidate>
+          <label class="field">
+            <span>预期正确率 p（0.51～0.99）</span>
+            <input type="number" id="planP" min="0.51" max="0.99" step="0.01" value="0.75" inputmode="decimal">
+          </label>
+          <label class="field">
+            <span>显著性水平 α</span>
+            <select id="planAlpha">
+              <option value="0.01">0.01（1%）</option>
+              <option value="0.05" selected>0.05（5%）</option>
+              <option value="0.10">0.10（10%）</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>目标功效（1 − β）</span>
+            <select id="planPower">
+              <option value="0.80" selected>0.80</option>
+              <option value="0.90">0.90</option>
+              <option value="0.95">0.95</option>
+            </select>
+          </label>
+          <button id="btnPlan" class="primary" type="submit">计算规划</button>
+        </form>
+        <p id="planError" class="error"></p>
+
+        <div id="planResult" class="plan-result hidden" aria-live="polite">
+          <p id="planSummary" class="plan-summary"></p>
+          <p class="hint">假阳性概率 = 纯靠猜（正确率 0.5）时答对至少 k 题的概率；实际功效 = 真实正确率为 p 时答对至少 k 题的概率。</p>
+          <div class="plan-table-wrap">
+            <table id="planTable">
+              <thead>
+                <tr>
+                  <th>题数 n</th><th>门槛 k</th><th>假阳性概率</th><th>实际功效</th><th>是否达标</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <button id="btnApplyPlan" type="button" class="primary">将推荐题数填入上方题数字段</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- 视图 2：测试 -->
+    <section id="view-test" class="view hidden">
+      <div class="card">
+        <div class="trial-bar">
+          <button id="btnPrev">← 上一题</button>
+          <span id="trialLabel" class="trial-label">第 1 / 8 题</span>
+          <button id="btnNext">下一题 →</button>
+        </div>
+
+        <div class="source-switch" role="group" aria-label="音源切换">
+          <button data-src="A" class="src-btn active">A</button>
+          <button data-src="B" class="src-btn">B</button>
+          <button data-src="X" class="src-btn">X（未知）</button>
+        </div>
+
+        <div class="transport">
+          <button id="btnPlay" class="primary">▶ 播放</button>
+          <span id="timeLabel" class="time">0:00.0 / 0:00.0</span>
+        </div>
+        <input type="range" id="seek" min="0" max="1" step="0.01" value="0" aria-label="播放进度">
+
+        <div class="loop-ctl">
+          <div class="loop-track" aria-hidden="true">
+            <div class="loop-region" id="loopRegion"></div>
+            <div class="loop-edge" id="loopEdgeIn"></div>
+            <div class="loop-edge" id="loopEdgeOut"></div>
+          </div>
+          <div class="loop-btns">
+            <button id="btnLoopIn" title="以当前播放位置为循环起点">⇤ 设为入点</button>
+            <button id="btnLoopOut" title="以当前播放位置为循环终点；设定后立即从入点开始循环">设为出点 ⇥</button>
+            <button id="btnLoopClear" disabled>清除循环</button>
+          </div>
+          <p id="loopInfo" class="hint" aria-live="polite">循环未设置</p>
+        </div>
+
+        <div class="level-match">
+          <label class="lm-toggle" title="解码后在统一时间轴内汇总各声道样本计算 RMS，以较安静音源为基准仅衰减较响者（-24～0 dB）；A / B / X 按同一规则生效">
+            <input type="checkbox" id="chkLevelMatch">
+            <span>电平匹配（消除响度差）</span>
+          </label>
+          <span id="levelInfo" class="hint">A 0.0 dB · B 0.0 dB</span>
+        </div>
+
+        <div class="crossfade">
+          <label class="cf-toggle" title="A / B / X 切换时新旧音源从同一时间位置并行播放，按等功率 sin/cos 曲线完成增益交接；循环区间与电平匹配同时生效">
+            <input type="checkbox" id="chkCrossfade" checked>
+            <span>切换淡化（等功率交叉淡化）</span>
+          </label>
+          <label class="cf-duration" title="交叉淡化时长（5～100 毫秒）">
+            <input type="number" id="crossfadeMs" min="5" max="100" step="1" value="30">
+            <span>ms</span>
+          </label>
+        </div>
+
+        <div class="answer-box">
+          <p>本题中 X 是哪一个？</p>
+          <div class="answer-btns">
+            <button id="btnAnsA">X = A</button>
+            <button id="btnAnsB">X = B</button>
+          </div>
+          <p class="conf-title">把握度（50% = 纯靠猜，100% = 确定无疑）</p>
+          <div class="conf-btns" role="group" aria-label="把握度选择">
+            <button class="conf-btn" data-conf="50">50%</button>
+            <button class="conf-btn" data-conf="60">60%</button>
+            <button class="conf-btn" data-conf="70">70%</button>
+            <button class="conf-btn" data-conf="80">80%</button>
+            <button class="conf-btn" data-conf="90">90%</button>
+            <button class="conf-btn" data-conf="100">100%</button>
+          </div>
+        </div>
+
+        <div id="progress" class="progress" aria-label="答题进度"></div>
+
+        <button id="btnSubmit" class="danger" disabled>提交并揭晓答案</button>
+        <p class="hint">提示：每题需同时选择「X = A / X = B」和把握度（50%～100%，每 10% 一档）才算完成，二者都会随题保存，可随时返回修改；在 A / B / X 之间切换时，播放位置与暂停状态保持不变，可开启「切换淡化」让新旧音源等功率平滑交接；可用「设为入点 / 设为出点」循环试听某一片段，切换音源、换题或拖动进度后循环依然有效；全部题目完成后提交，一次性揭晓并按把握度分档给出实际正确率与 95% 精确置信区间。</p>
+      </div>
+    </section>
+
+    <!-- 视图 3：结果 -->
+    <section id="view-result" class="view hidden">
+      <div class="card">
+        <h2>测试结果</h2>
+        <p id="scoreLabel" class="score"></p>
+        <table id="resultTable">
+          <thead>
+            <tr><th>题号</th><th>X 实际是</th><th>你的答案</th><th>把握度</th><th>判定</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+        <button id="btnAgain" class="primary">再来一轮</button>
+      </div>
+
+      <div class="card">
+        <h2>题序承诺核验</h2>
+        <p id="verifyStatus" class="verify-status unknown">核验中…</p>
+        <dl class="verify-list">
+          <dt>本机保存的原承诺值</dt>
+          <dd id="verifySaved">—</dd>
+          <dt>揭示后重算的承诺值</dt>
+          <dd id="verifyRecomputed">—</dd>
+          <dt>随机盐（hex）</dt>
+          <dd id="verifySalt">—</dd>
+          <dt>题序映射（逐题 X 实际值）</dt>
+          <dd id="verifyMapping">—</dd>
+        </dl>
+        <p class="hint">创建会话时服务端生成 32 字节随机盐，并按 <code>abx-v1|会话ID|题数|逐题A/B串|盐</code> 计算 SHA-256 承诺值，承诺值随恢复信息保存在本机；提交前任何接口都不返回盐与映射，提交后服务端才揭示。此处由浏览器用 Web Crypto 重新计算承诺值，并与最初保存的原值比对：一致说明答题期间题序未被更改。本机没有原承诺值时显示「无法核验」，不会用服务端当前值代替。</p>
+      </div>
+
+      <div class="card">
+        <h2>把握度校准</h2>
+        <p class="hint">按自评把握度分档统计。所有元素共用同一条 0～100% 横轴：<span class="legend-marker legend-conf">◆</span> 为自评把握度，<span class="legend-marker legend-acc">●</span> 为该档实际正确率，横条为 95% Clopper–Pearson 精确置信区间（服务端数值反解，非正态近似）。把握度标记未落入区间时<span class="legend-marker legend-off">◆</span>标红：在区间右侧说明过度自信，在左侧说明信心不足；没有题目的档位显示「无数据」。</p>
+        <div id="calibChart" class="calib-chart"></div>
+        <table id="calibTable">
+          <thead>
+            <tr><th>把握度</th><th>题数</th><th>答对</th><th>实际正确率</th><th>95% 置信区间</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <p>所有音频与会话数据仅保存在本机，不会发送到任何外部服务器。</p>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
