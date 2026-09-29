@@ -5,7 +5,12 @@
  *
  * 设计要点：
  * - 音频文件只保存在本机磁盘（DATA_DIR，默认 ./data/<sessionId>/）
- * - 会话状态（含 X 映射）只保存在本机内存中，提交前任何接口都不会泄露映射
+ * - 会话状态（含 X 映射）只保存在本机内存与本机磁盘（会话目录下的
+ *   session.json），提交前任何接口都不会泄露映射
+ * - 持久化：创建会话与每次作答 / 提交成功响应前，把会话状态以
+ *   「临时文件 + fsync + rename」原子写入现有 data 目录下的会话目录；
+ *   服务重启时只恢复未过期且 A/B 音频完整、记录合法（含承诺值重算校验）
+ *   的会话，损坏、缺文件或半写入的记录一律不恢复
  * - 题序承诺核验：创建会话时生成 32 字节随机盐，按固定格式
  *   abx-v1|会话ID|题数|逐题A/B串|盐的十六进制 计算 SHA-256 承诺值；
  *   提交前创建 / 状态 / 恢复接口只返回承诺值（不返回盐与映射），
@@ -37,7 +42,7 @@ const ALLOWED_EXT = new Set([
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
-/** 会话仅保存在本机内存：id -> session */
+/** 会话：内存索引 id -> session，创建 / 作答 / 提交时同步原子落盘到会话目录 */
 const sessions = new Map();
 
 /** 恢复标识（仅存 SHA-256 哈希）：tokenHash -> sessionId，提交/删除/过期即移除 */
@@ -64,6 +69,85 @@ function dropRecoveryToken(s) {
   if (s && s.tokenHash) {
     recoveryTokens.delete(s.tokenHash);
     s.tokenHash = null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 会话状态持久化（原子写入）
+//
+// 每个会话目录下保存一份 session.json（v1 记录）：
+//   { version, id, createdAt, submitted, tokenHash, saltHex, commitment,
+//     nameA, nameB, audio: { A, B }, trials: [{ x, answer, confidence }] }
+// tokenHash 是恢复标识的 SHA-256（明文标识只随创建响应下发一次，磁盘与内存
+// 一样只存哈希）；盐与逐题映射（trials.x）是服务端秘密，只落本机磁盘，
+// 提交前任何接口都不下发。
+//
+// 原子性：先写同目录临时文件并 fsync，再 rename 覆盖（同目录必为同一文件
+// 系统，rename 原子），最后尽力 fsync 目录；崩溃只会留下完整的旧记录或完整
+// 的新记录，残留的临时文件在启动时清理。写入失败时抛错，调用方不得改变
+// 任何已确认状态。
+// ---------------------------------------------------------------------------
+
+const STATE_VERSION = 1;
+const STATE_FILE = 'session.json';
+const STATE_TMP_PREFIX = '.session.json.';
+const AUDIO_NAME_RE = /^[AB]\.[a-z0-9]+$/;
+
+function statePath(dir) {
+  return path.join(dir, STATE_FILE);
+}
+
+/**
+ * 序列化会话状态。opts 用于在不改动内存对象的前提下描述「即将生效」的状态：
+ * - opts.trialPatch：{ index, answer?, confidence? } 仅覆盖该题的对应字段
+ * - opts.submitted：覆盖 submitted 标志（提交时落盘发生在内存置位之前）
+ * 已提交的记录不写 tokenHash：提交后恢复标识持续失效，重启也不可恢复。
+ */
+function serializeSession(s, opts = {}) {
+  const submitted = opts.submitted !== undefined ? opts.submitted : s.submitted;
+  const trials = s.trials.map((t, i) => {
+    let { answer, confidence } = t;
+    if (opts.trialPatch && opts.trialPatch.index === i) {
+      if (opts.trialPatch.answer !== undefined) answer = opts.trialPatch.answer;
+      if (opts.trialPatch.confidence !== undefined) confidence = opts.trialPatch.confidence;
+    }
+    return { x: t.x, answer, confidence };
+  });
+  return JSON.stringify({
+    version: STATE_VERSION,
+    id: s.id,
+    createdAt: s.createdAt,
+    submitted,
+    tokenHash: submitted ? null : (s.tokenHash || null),
+    saltHex: s.saltHex,
+    commitment: s.commitment,
+    nameA: s.nameA,
+    nameB: s.nameB,
+    audio: { A: path.basename(s.fileA), B: path.basename(s.fileB) },
+    trials,
+  }, null, 2);
+}
+
+/** 原子写入会话状态：临时文件 + fsync + rename + 尽力目录 fsync；失败抛错并清理临时文件 */
+function persistSession(s, opts) {
+  const data = serializeSession(s, opts);
+  const tmp = path.join(s.dir, `${STATE_TMP_PREFIX}${process.pid}.${crypto.randomBytes(6).toString('hex')}`);
+  let fd = null;
+  try {
+    fd = fs.openSync(tmp, 'wx'); // 独占创建，避免与残留临时文件互相覆盖
+    fs.writeSync(fd, data);
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = null;
+    fs.renameSync(tmp, statePath(s.dir));
+    try {
+      const dfd = fs.openSync(s.dir, 'r');
+      try { fs.fsyncSync(dfd); } finally { fs.closeSync(dfd); }
+    } catch (_) { /* 目录 fsync 失败不影响 rename 的原子性 */ }
+  } catch (err) {
+    if (fd !== null) { try { fs.closeSync(fd); } catch (_) { /* 忽略 */ } }
+    try { fs.unlinkSync(tmp); } catch (_) { /* 忽略 */ }
+    throw err;
   }
 }
 
@@ -317,6 +401,182 @@ function removeDir(dir) {
   if (dir) fs.rm(dir, { recursive: true, force: true }, () => {});
 }
 
+/** 提交结果（揭示数据）：提交时与重启恢复已提交会话时按同一逻辑重建 */
+function buildResults(s) {
+  const detail = s.trials.map((t, i) => ({
+    trial: i + 1,
+    x: t.x,
+    answer: t.answer,
+    confidence: t.confidence,
+    correct: t.x === t.answer,
+  }));
+  const correct = detail.filter((d) => d.correct).length;
+  return {
+    total: detail.length,
+    correct,
+    accuracy: correct / detail.length,
+    detail,
+    calibration: buildCalibration(s.trials),
+    // 题序承诺揭示：盐与映射提交后才下发；重复提交与已提交状态读取返回同一数据
+    salt: s.saltHex,
+    mapping: s.mapping,
+    commitment: s.commitment,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 启动恢复：扫描 DATA_DIR，只恢复「未过期 + 记录合法 + A/B 音频完整」的会话。
+// 损坏记录、缺文件、半写入（只有音频没有 session.json，或只有残留临时文件）
+// 的目录一律不恢复并清理；过期目录按 TTL 清理；读取失败（如权限问题）的
+// 目录保留原样、不做删除。
+// ---------------------------------------------------------------------------
+
+/** 解析并校验单个会话目录；返回 { status, session? } */
+function loadSessionDir(dir) {
+  let raw;
+  try {
+    raw = fs.readFileSync(statePath(dir), 'utf8');
+  } catch (err) {
+    // 没有状态文件：上传中断等留下的半写入目录
+    return { status: err && err.code === 'ENOENT' ? 'no-state' : 'io-error' };
+  }
+  let rec;
+  try {
+    rec = JSON.parse(raw);
+  } catch (_) {
+    return { status: 'corrupt' }; // 截断 / 损坏的 JSON：原子写入不会产生，按坏记录处理
+  }
+  if (!rec || typeof rec !== 'object' || rec.version !== STATE_VERSION) {
+    return { status: 'invalid' };
+  }
+  if (typeof rec.createdAt !== 'number' || !Number.isFinite(rec.createdAt)
+      || rec.createdAt > Date.now() + 5 * 60 * 1000) {
+    return { status: 'invalid' };
+  }
+  // 过期即清理，不再校验其余字段
+  if (Date.now() - rec.createdAt > SESSION_TTL_MS) return { status: 'expired' };
+  const id = rec.id;
+  if (typeof id !== 'string' || id !== path.basename(dir)) return { status: 'invalid' };
+  if (!Array.isArray(rec.trials) || rec.trials.length < 1 || rec.trials.length > MAX_TRIALS) {
+    return { status: 'invalid' };
+  }
+  const trials = [];
+  for (const t of rec.trials) {
+    if (!t || typeof t !== 'object') return { status: 'invalid' };
+    if (t.x !== 'A' && t.x !== 'B') return { status: 'invalid' };
+    if (t.answer !== null && t.answer !== 'A' && t.answer !== 'B') return { status: 'invalid' };
+    if (t.confidence !== null && !CONFIDENCE_SET.has(t.confidence)) return { status: 'invalid' };
+    trials.push({ x: t.x, answer: t.answer, confidence: t.confidence });
+  }
+  if (rec.submitted !== true && rec.submitted !== false) return { status: 'invalid' };
+  if (rec.submitted && trials.some((t) => !t.answer || t.confidence === null)) {
+    return { status: 'invalid' }; // 已提交记录必须答案与把握度齐全
+  }
+  if (rec.tokenHash !== null
+      && (typeof rec.tokenHash !== 'string' || !/^[0-9a-f]{64}$/.test(rec.tokenHash))) {
+    return { status: 'invalid' };
+  }
+  if (rec.submitted && rec.tokenHash !== null) return { status: 'invalid' };
+  if (typeof rec.saltHex !== 'string' || !/^[0-9a-f]{64}$/.test(rec.saltHex)) {
+    return { status: 'invalid' };
+  }
+  const mapping = trials.map((t) => t.x).join('');
+  // 承诺值重算校验：id、题数、映射、盐任一被改动都会失配，记录视为不合法
+  if (typeof rec.commitment !== 'string'
+      || rec.commitment !== computeCommitment(id, trials.length, mapping, rec.saltHex)) {
+    return { status: 'invalid' };
+  }
+  if (!rec.audio || typeof rec.audio !== 'object') return { status: 'invalid' };
+  const files = {};
+  for (const which of ['A', 'B']) {
+    const name = rec.audio[which];
+    if (typeof name !== 'string' || !AUDIO_NAME_RE.test(name)) return { status: 'invalid' };
+    if (!ALLOWED_EXT.has(path.extname(name))) return { status: 'invalid' };
+    const p = path.join(dir, name);
+    let st;
+    try {
+      st = fs.statSync(p);
+    } catch (err) {
+      return { status: err && err.code === 'ENOENT' ? 'invalid' : 'io-error' };
+    }
+    if (!st.isFile() || st.size === 0) return { status: 'invalid' };
+    files[which] = p;
+  }
+  const session = {
+    id,
+    dir,
+    fileA: files.A,
+    fileB: files.B,
+    nameA: typeof rec.nameA === 'string' && rec.nameA.length <= 512 ? rec.nameA : path.basename(files.A),
+    nameB: typeof rec.nameB === 'string' && rec.nameB.length <= 512 ? rec.nameB : path.basename(files.B),
+    trials,
+    mapping,
+    saltHex: rec.saltHex,
+    commitment: rec.commitment,
+    submitted: rec.submitted,
+    results: null,
+    createdAt: rec.createdAt,
+    tokenHash: rec.tokenHash,
+  };
+  if (session.submitted) session.results = buildResults(session);
+  return { status: 'ok', session };
+}
+
+/** 启动时从磁盘恢复会话；同时清理残留临时文件、不可用记录目录与过期目录 */
+function restoreSessionsFromDisk() {
+  let entries;
+  try {
+    entries = fs.readdirSync(DATA_DIR, { withFileTypes: true });
+  } catch (err) {
+    console.error(`无法读取数据目录 ${DATA_DIR}，跳过会话恢复: ${err.message}`);
+    return;
+  }
+  let restored = 0;
+  for (const e of entries) {
+    // 崩溃残留的原子写临时文件：直接清理
+    if (e.isFile() && e.name.startsWith(STATE_TMP_PREFIX)) {
+      fs.rm(path.join(DATA_DIR, e.name), { force: true }, () => {});
+      continue;
+    }
+    if (!e.isDirectory()) continue;
+    const dir = path.join(DATA_DIR, e.name);
+    // 崩溃残留的原子写临时文件（在会话目录内部）：先清理再校验
+    let inner;
+    try {
+      inner = fs.readdirSync(dir);
+    } catch (err) {
+      console.warn(`会话目录 ${e.name} 读取失败，保留原样，未恢复: ${err.message}`);
+      continue;
+    }
+    for (const f of inner) {
+      if (f.startsWith(STATE_TMP_PREFIX)) {
+        fs.rm(path.join(dir, f), { force: true }, () => {});
+      }
+    }
+    const { status, session } = loadSessionDir(dir);
+    if (status === 'ok') {
+      sessions.set(session.id, session);
+      if (!session.submitted && session.tokenHash) {
+        recoveryTokens.set(session.tokenHash, session.id);
+      }
+      restored += 1;
+      continue;
+    }
+    if (status === 'io-error') {
+      console.warn(`会话目录 ${e.name} 读取失败，保留原样，未恢复`);
+      continue;
+    }
+    // no-state / corrupt / invalid / expired：不可恢复，连目录带音频清理
+    fs.rm(dir, { recursive: true, force: true }, (err) => {
+      if (err) console.warn(`清理会话目录 ${dir} 失败: ${err.message}`);
+    });
+    if (status !== 'expired') {
+      console.warn(`会话目录 ${e.name} 的记录不可用（${status}），未恢复，已清理`);
+    }
+  }
+  if (restored > 0) console.log(`已从磁盘恢复 ${restored} 个会话`);
+}
+
 app.post('/api/session', (req, res) => {
   upload.fields([{ name: 'a', maxCount: 1 }, { name: 'b', maxCount: 1 }])(req, res, (err) => {
     if (err) {
@@ -347,7 +607,7 @@ app.post('/api/session', (req, res) => {
     const saltHex = crypto.randomBytes(32).toString('hex');
     const commitment = computeCommitment(id, numTrials, mapping, saltHex);
 
-    sessions.set(id, {
+    const session = {
       id,
       dir: req.abxDir,
       fileA: req.files.a[0].path,
@@ -362,7 +622,17 @@ app.post('/api/session', (req, res) => {
       results: null,
       createdAt: Date.now(),
       tokenHash,
-    });
+    };
+
+    // 先把状态原子落盘，成功后才确认会话：写失败则清理已上传文件并返回错误
+    try {
+      persistSession(session);
+    } catch (err) {
+      removeDir(req.abxDir);
+      return res.status(500).json({ error: `会话状态保存失败：${err.message}` });
+    }
+
+    sessions.set(id, session);
     recoveryTokens.set(tokenHash, id);
 
     res.json({ id, numTrials, recoveryToken, commitment });
@@ -468,6 +738,15 @@ app.post('/api/session/:id/answer', (req, res) => {
   if (hasConfidence && !CONFIDENCE_SET.has(confidence)) {
     return res.status(400).json({ error: '把握度无效（只允许 50%～100%，每 10% 一档）' });
   }
+  // 先把新状态原子落盘，成功后才更新内存并确认：写失败时已确认状态不变
+  const trialPatch = { index: s.trials.indexOf(t) };
+  if (hasAnswer) trialPatch.answer = answer;
+  if (hasConfidence) trialPatch.confidence = confidence;
+  try {
+    persistSession(s, { trialPatch });
+  } catch (err) {
+    return res.status(500).json({ error: `答案保存失败：${err.message}` });
+  }
   if (hasAnswer) t.answer = answer;
   if (hasConfidence) t.confidence = confidence;
   res.json({ ok: true });
@@ -481,25 +760,15 @@ app.post('/api/session/:id/submit', (req, res) => {
     return res.status(400).json({ error: '还有题目未作答或未选择把握度，无法提交' });
   }
   // 提交后一次性揭示：正确率 + 逐题映射（含把握度）+ 分档校准 + 题序承诺揭示
-  const detail = s.trials.map((t, i) => ({
-    trial: i + 1,
-    x: t.x,
-    answer: t.answer,
-    confidence: t.confidence,
-    correct: t.x === t.answer,
-  }));
-  const correct = detail.filter((d) => d.correct).length;
-  s.results = {
-    total: detail.length,
-    correct,
-    accuracy: correct / detail.length,
-    detail,
-    calibration: buildCalibration(s.trials),
-    // 题序承诺揭示：盐与映射提交后才下发；重复提交与已提交状态读取返回同一数据
-    salt: s.saltHex,
-    mapping: s.mapping,
-    commitment: s.commitment,
-  };
+  const results = buildResults(s);
+  // 先把「已提交」状态原子落盘（落盘记录不再含恢复标识哈希），
+  // 成功后才确认提交：写失败时会话保持未提交，可重试
+  try {
+    persistSession(s, { submitted: true });
+  } catch (err) {
+    return res.status(500).json({ error: `提交状态保存失败：${err.message}` });
+  }
+  s.results = results;
   s.submitted = true;
   dropRecoveryToken(s); // 提交后恢复标识立即失效
   res.json({ results: s.results });
@@ -529,6 +798,9 @@ setInterval(() => {
     }
   }
 }, 3600 * 1000).unref();
+
+// 启动时先从磁盘恢复未过期且完整的会话（详见 restoreSessionsFromDisk）
+restoreSessionsFromDisk();
 
 app.listen(PORT, () => {
   console.log(`ABX 盲听测试已启动: http://localhost:${PORT}`);
